@@ -1,0 +1,10 @@
+build/
+dist/
+存档/
+__pycache__/
+*.pyc
+*.pyo
+*.spec
+*.exe
+.DS_Store
+Thumbs.db

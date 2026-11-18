@@ -8,6 +8,7 @@ Steam Input 配置备份管理工具
 - 立即存档：把 Steam 里当前全部 VDF 按时间戳保存到软件目录下的「存档」文件夹，不删除已有文件
 - 恢复：选择一个游戏，把存档复制回该游戏原来的 Steam 目录
 - 可在软件内把一个游戏的 VDF 迁移到另一个游戏
+- 可按 1 分钟 / 10 分钟 / 1 小时 / 1 天 对比最新存档与 Steam 原文件 MD5，不同则自动存档
 - 图形界面 + 系统托盘
 """
 
@@ -38,6 +39,35 @@ APP_NAME = "SteamInputBackup"
 CONFIG_FILE = Path.home() / "AppData" / "Roaming" / APP_NAME / "config.json"
 TIMESTAMP_FMT = "%Y%m%d_%H%M%S"
 SNAPSHOT_DIR_RE = re.compile(r"^\d{8}_\d{6}(?:_\d+)?$")
+
+CHECK_INTERVAL_CHOICES = [
+    ("off", "关闭", 0),
+    ("1m", "1分钟", 60),
+    ("10m", "10分钟", 600),
+    ("1h", "1小时", 3600),
+    ("1d", "1天", 86400),
+]
+CHECK_INTERVAL_SECONDS = {key: seconds for key, _label, seconds in CHECK_INTERVAL_CHOICES}
+
+
+def normalize_check_interval(value):
+    if value in CHECK_INTERVAL_SECONDS:
+        return value
+    return "off"
+
+
+MIN_BACKUPS = 10
+MAX_BACKUPS_LIMIT = 100
+DEFAULT_MAX_BACKUPS = 20
+
+
+def normalize_max_backups(value):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        n = DEFAULT_MAX_BACKUPS
+    return max(MIN_BACKUPS, min(MAX_BACKUPS_LIMIT, n))
+
 OLD_DOCUMENTS_BACKUP_DIR = Path.home() / "Documents" / "SteamInputBackups"
 
 
@@ -372,6 +402,8 @@ class SteamInputBackupApp:
         self.settings = self.load_settings()
         self.backup_thread = None
         self.running = True
+        self.check_wakeup = threading.Event()
+        self.archive_lock = threading.Lock()
         self.tray_icon = None
         self.appid_names = {}
 
@@ -386,6 +418,7 @@ class SteamInputBackupApp:
 
         # 启动只刷新软件同目录下的存档，不扫描 Steam
         self.refresh_tree()
+        self.start_backup_thread()
 
     # ---------- 设置 ----------
     def load_settings(self):
@@ -393,11 +426,9 @@ class SteamInputBackupApp:
         default = {
             "steam_path": "",
             "backup_dir": str(DEFAULT_BACKUP_DIR),
-            "interval_minutes": 5,
-            "max_backups": 20,
-            "auto_backup": False,
+            "check_interval": "off",
+            "max_backups": DEFAULT_MAX_BACKUPS,
             "monitor_common": True,
-            "monitor_userdata": True,
         }
         if CONFIG_FILE.exists():
             try:
@@ -408,7 +439,9 @@ class SteamInputBackupApp:
                 pass
         # 存档固定在软件同目录下的「存档」，启动时只读这里，不读文档或其他位置
         default["backup_dir"] = str(DEFAULT_BACKUP_DIR)
-        default["auto_backup"] = False
+        default["check_interval"] = normalize_check_interval(default.get("check_interval"))
+        default["max_backups"] = normalize_max_backups(default.get("max_backups"))
+        default.pop("monitor_userdata", None)
         return default
 
     def save_settings(self):
@@ -476,6 +509,8 @@ class SteamInputBackupApp:
         item = self.tree.identify_row(event.y)
         if item:
             self.tree.selection_set(item)
+            state = "normal" if self.get_selected_vdf_path() else "disabled"
+            self.menu.entryconfig("打开备份所在文件夹", state=state)
             self.menu.post(event.x_root, event.y_root)
 
     def game_label(self, folder_name: str) -> str:
@@ -516,96 +551,88 @@ class SteamInputBackupApp:
                         if cfg.exists():
                             roots.append(cfg)
 
-        # 2. userdata/<userid>/241100/remote/controller_config/
-        if self.settings.get("monitor_userdata", True):
-            userdata = steam / "userdata"
-            if userdata.exists():
-                for userid in userdata.iterdir():
-                    if userid.is_dir():
-                        cfg = userid / "241100" / "remote" / "controller_config"
-                        if cfg.exists():
-                            roots.append(cfg)
         return roots
 
-    def scan_and_backup(self, force=False):
-        """扫描并备份有变化的 .vdf 文件"""
-        backup_root = Path(self.settings["backup_dir"])
-        backup_root.mkdir(parents=True, exist_ok=True)
-        backed = 0
+    def check_interval_seconds(self):
+        key = normalize_check_interval(self.settings.get("check_interval"))
+        return CHECK_INTERVAL_SECONDS[key]
 
+    def iter_steam_vdfs(self):
         for config_root in self.get_config_roots():
-            # config_root 下是各个游戏文件夹（AppID 或游戏名）
-            for game_dir in config_root.iterdir():
+            try:
+                game_dirs = list(config_root.iterdir())
+            except Exception:
+                continue
+            for game_dir in game_dirs:
                 if not game_dir.is_dir():
                     continue
-                game_name = game_dir.name  # AppID 或非 Steam 游戏名
-                game_backup_dir = backup_root / game_name
-                game_backup_dir.mkdir(exist_ok=True)
-
                 for vdf in game_dir.rglob("*.vdf"):
-                    if not vdf.is_file():
-                        continue
-                    try:
-                        orig_hash = file_hash(vdf)
-                        if not orig_hash:
-                            continue
+                    if vdf.is_file():
+                        yield game_dir.name, vdf.relative_to(game_dir), vdf
 
-                        # 查找该文件的最新备份
-                        stem = vdf.stem
-                        pattern = f"{stem}_*.vdf"
-                        existing = sorted(game_backup_dir.glob(pattern), reverse=True)
-                        latest = existing[0] if existing else None
+    def latest_snapshot_dir(self):
+        backup_root = Path(self.settings["backup_dir"])
+        if not backup_root.exists():
+            return None
+        snaps = [p for p in backup_root.iterdir() if p.is_dir() and SNAPSHOT_DIR_RE.match(p.name)]
+        if not snaps:
+            return None
+        return sorted(snaps, key=lambda p: p.name, reverse=True)[0]
 
-                        need_backup = force
-                        if latest and not force:
-                            latest_hash = file_hash(latest)
-                            if latest_hash == orig_hash:
-                                need_backup = False
-                        else:
-                            need_backup = True
+    def latest_snapshot_differs(self):
+        """最新时间戳存档与当前 Steam 原文件的 MD5 / 文件集合不一致则返回 True。"""
+        steam_files = list(self.iter_steam_vdfs())
+        if not steam_files:
+            return False
+        snap = self.latest_snapshot_dir()
+        if not snap:
+            return True
+        snap_map = {}
+        for game_dir in snap.iterdir():
+            if not game_dir.is_dir():
+                continue
+            for vdf in game_dir.rglob("*.vdf"):
+                if vdf.is_file():
+                    snap_map[(game_dir.name, vdf.relative_to(game_dir).as_posix())] = vdf
+        steam_keys = set()
+        for game_name, rel, path in steam_files:
+            key = (game_name, Path(rel).as_posix())
+            steam_keys.add(key)
+            bak = snap_map.get(key)
+            if not bak or file_hash(path) != file_hash(bak):
+                return True
+        return set(snap_map) != steam_keys
 
-                        if need_backup:
-                            ts = datetime.now().strftime(TIMESTAMP_FMT)
-                            dest_name = f"{stem}_{ts}.vdf"
-                            dest = game_backup_dir / dest_name
-                            # 防止同秒冲突
-                            i = 1
-                            while dest.exists():
-                                dest = game_backup_dir / f"{stem}_{ts}_{i}.vdf"
-                                i += 1
-                            shutil.copy2(vdf, dest)
-                            # 写入一个简单的 sidecar 记录原始路径（可选）
-                            meta = dest.with_suffix(".meta.json")
-                            with open(meta, "w", encoding="utf-8") as mf:
-                                json.dump({
-                                    "original": str(vdf),
-                                    "game": game_name,
-                                    "timestamp": ts,
-                                    "hash": orig_hash
-                                }, mf, ensure_ascii=False)
-                            backed += 1
-
-                    except Exception as e:
-                        print(f"备份失败 {vdf}: {e}")
-
-        return backed
+    def run_scheduled_check(self):
+        with self.archive_lock:
+            changed = self.latest_snapshot_differs()
+            if not changed:
+                self.root.after(0, lambda: self.status_var.set("定时检查：最新存档与 Steam 原文件一致，无需备份"))
+                return
+            n, ts, pruned = self.archive_all(locked=True)
+        dest = Path(self.settings["backup_dir"]) / ts
+        extra = f"，并删除 {pruned} 份最旧存档" if pruned else ""
+        self.root.after(0, lambda: self.status_var.set(f"检测到配置变化，已自动存档 {n} 个文件 → {dest}{extra}"))
+        self.root.after(0, self.refresh_tree)
 
     def backup_loop(self):
         while self.running:
-            if self.settings.get("auto_backup", True):
-                try:
-                    n = self.scan_and_backup()
-                    if n > 0:
-                        self.root.after(0, lambda: self.status_var.set(f"自动备份完成，新增 {n} 个文件"))
-                        self.root.after(0, self.refresh_tree)
-                except Exception as e:
-                    print("备份循环异常:", e)
-            interval = max(1, int(self.settings.get("interval_minutes", 5))) * 60
-            # 分段 sleep 以便快速退出
-            for _ in range(interval):
-                if not self.running:
-                    break
-                time.sleep(1)
+            seconds = self.check_interval_seconds()
+            if seconds <= 0:
+                self.check_wakeup.wait(0.5)
+                self.check_wakeup.clear()
+                continue
+            self.check_wakeup.clear()
+            if self.check_wakeup.wait(seconds):
+                self.check_wakeup.clear()
+                continue
+            if not self.running or self.check_interval_seconds() <= 0:
+                continue
+            try:
+                self.run_scheduled_check()
+            except Exception as e:
+                print("定时检查异常:", e)
+                self.root.after(0, lambda err=str(e): self.status_var.set(f"定时检查失败: {err}"))
 
     def start_backup_thread(self):
         if self.backup_thread and self.backup_thread.is_alive():
@@ -613,8 +640,14 @@ class SteamInputBackupApp:
         self.backup_thread = threading.Thread(target=self.backup_loop, daemon=True)
         self.backup_thread.start()
 
-    def archive_all(self):
+    def archive_all(self, locked=False):
         """把 Steam 里当前全部 VDF 存到软件存档目录，目录名带统一时间戳。不删除任何已有文件。"""
+        if locked:
+            return self._archive_all_impl()
+        with self.archive_lock:
+            return self._archive_all_impl()
+
+    def _archive_all_impl(self):
         self.settings["backup_dir"] = str(DEFAULT_BACKUP_DIR)
         backup_root = Path(self.settings["backup_dir"])
         backup_root.mkdir(parents=True, exist_ok=True)
@@ -651,25 +684,27 @@ class SteamInputBackupApp:
                         backed += 1
                     except Exception as e:
                         print(f"存档失败 {vdf}: {e}")
-        return backed, snap.name
+        pruned = self.prune_old_snapshots()
+        return backed, snap.name, pruned
 
     def manual_backup(self):
         self.status_var.set("正在存档全部 Steam 配置...")
         self.root.update()
         def do():
             try:
-                n, ts = self.archive_all()
+                n, ts, pruned = self.archive_all()
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("失败", f"存档失败: {e}"))
                 self.root.after(0, lambda: self.status_var.set("存档失败"))
                 return
             dest = Path(self.settings["backup_dir"]) / ts
-            self.root.after(0, lambda: self.status_var.set(f"存档完成，共 {n} 个文件 → {dest}"))
+            extra = f"，并删除 {pruned} 份最旧存档" if pruned else ""
+            self.root.after(0, lambda: self.status_var.set(f"存档完成，共 {n} 个文件 → {dest}{extra}"))
             self.root.after(0, self.refresh_tree)
-            self.root.after(0, lambda: messagebox.showinfo(
-                "完成",
-                f"已把当前 Steam 里的全部 VDF 存档，共 {n} 个文件。\n\n位置：\n{dest}\n\n不会删除本目录下已有文件。",
-            ))
+            msg = f"已把当前 Steam 里的全部 VDF 存档，共 {n} 个文件。\n\n位置：\n{dest}"
+            if pruned:
+                msg += f"\n\n已按上限删除 {pruned} 份最旧的时间戳存档。"
+            self.root.after(0, lambda: messagebox.showinfo("完成", msg))
         threading.Thread(target=do, daemon=True).start()
 
     def _count_files(self, path: Path) -> int:
@@ -680,6 +715,29 @@ class SteamInputBackupApp:
             if p.is_file() and p.suffix.lower() != ".json":
                 n += 1
         return n
+
+    def list_snapshot_dirs(self):
+        backup_root = Path(self.settings["backup_dir"])
+        if not backup_root.exists():
+            return []
+        return sorted(
+            (p for p in backup_root.iterdir() if p.is_dir() and SNAPSHOT_DIR_RE.match(p.name)),
+            key=lambda p: p.name,
+            reverse=True,
+        )
+
+    def prune_old_snapshots(self):
+        """按设置的上限只保留最新的若干份时间戳存档，删除更旧的。不删旧式散落目录。"""
+        limit = normalize_max_backups(self.settings.get("max_backups"))
+        snaps = self.list_snapshot_dirs()
+        removed = 0
+        for path in snaps[limit:]:
+            try:
+                shutil.rmtree(path)
+                removed += 1
+            except Exception as e:
+                print(f"删除旧存档失败 {path}: {e}")
+        return removed
 
     def collect_old_archives(self):
         """找出可删除的旧存档，以及要保留的最近一次时间戳。"""
@@ -1030,17 +1088,11 @@ class SteamInputBackupApp:
         filter_var.trace_add("write", refresh_list)
         refresh_list()
 
-        write_live = BooleanVar(value=True)
-        ttk.Checkbutton(
-            win,
-            text="同时写入 Steam 实时配置目录（会先备份目标游戏的同名 VDF 再覆盖）",
-            variable=write_live,
-        ).grid(row=3, column=1, sticky="w", padx=5, pady=6)
-
         hint = (
+            "只会改写 Steam 里目标游戏的配置，不会在本软件存档目录再复制一份；需要存档时请自行点击「立即存档」。"
             "上方是搜索过滤，请务必在列表里点选目标游戏。改完后需完全退出并重新打开 Steam 才会看到新布局。"
         )
-        ttk.Label(win, text=hint, foreground="#555").grid(row=4, column=1, sticky="w", padx=5)
+        ttk.Label(win, text=hint, wraplength=480, foreground="#555").grid(row=3, column=1, sticky="w", padx=5)
 
         def resolve_target():
             typed = filter_var.get().strip()
@@ -1074,55 +1126,40 @@ class SteamInputBackupApp:
                 ):
                     return
             confirm = (
-                f"将把以下配置迁移到：\n{self.game_label(target)}\n\n"
+                f"将把以下配置写入 Steam 中的目标游戏：\n{self.game_label(target)}\n\n"
                 f"{file_names}\n\n"
+                "只会修改 Steam 下的文件，不会在本软件存档目录再复制一份。"
+                "目标位置的同名文件会被覆盖。需要存档时请自行点击「立即存档」。"
             )
-            if write_live.get():
-                confirm += "会写入 Steam 实时配置，并先备份目标游戏的同名文件。"
-            else:
-                confirm += "仅复制到本软件的备份目录，不写入 Steam。"
             if not messagebox.askyesno("确认迁移", confirm, parent=win):
                 return
             try:
-                live_n, bak_n = self.perform_migrate(
-                    source_game, items, target, write_live=write_live.get()
-                )
+                live_n = self.perform_migrate(source_game, items, target)
             except Exception as e:
                 messagebox.showerror("失败", f"迁移失败: {e}", parent=win)
                 return
             win.destroy()
-            self.refresh_tree()
-            msg = f"已迁移 {bak_n} 个备份到 {self.game_label(target)}"
-            if write_live.get():
-                msg += f"，并写入 Steam 配置 {live_n} 处。请完全退出 Steam 后重新打开，再进目标游戏查看布局。"
-            else:
-                msg += "。未写入 Steam 实时配置。"
+            msg = (
+                f"已写入 Steam 配置 {live_n} 处，目标游戏：{self.game_label(target)}。"
+                "请完全退出 Steam 后重新打开，再进目标游戏查看布局。"
+            )
             self.status_var.set(msg)
             messagebox.showinfo("完成", msg)
 
         btns = ttk.Frame(win)
-        btns.grid(row=5, column=1, sticky="e", padx=5, pady=16)
+        btns.grid(row=4, column=1, sticky="e", padx=5, pady=16)
         ttk.Button(btns, text="取消", command=win.destroy).pack(side="right", padx=4)
         ttk.Button(btns, text="开始迁移", command=do_migrate).pack(side="right", padx=4)
 
         win.grid_columnconfigure(1, weight=1)
         win.grid_rowconfigure(2, weight=1)
 
-    def perform_migrate(self, source_game, items, target_game, write_live=True):
-        backup_root = Path(self.settings["backup_dir"])
-        target_backup = backup_root / target_game
-        target_backup.mkdir(parents=True, exist_ok=True)
+    def perform_migrate(self, source_game, items, target_game):
+        live_dirs = [root / target_game for root in self.get_config_roots()]
+        if not live_dirs:
+            raise RuntimeError("未找到 Steam 配置目录，请先在设置里确认 Steam 安装路径。")
 
-        live_dirs = []
-        if write_live:
-            live_dirs = [root / target_game for root in self.get_config_roots()]
-            if not live_dirs:
-                raise RuntimeError("未找到 Steam 配置目录，请先在设置里确认 Steam 安装路径。")
-
-        ts = datetime.now().strftime(TIMESTAMP_FMT)
         live_written = 0
-        bak_written = 0
-
         for stem, bak_path in items:
             bak_path = Path(bak_path)
             if not bak_path.exists():
@@ -1131,14 +1168,12 @@ class SteamInputBackupApp:
             raw = bak_path.read_text(encoding="utf-8", errors="ignore")
             ctype = detect_controller_type(raw)
 
-            live_path = ""
-            for idx, live_dir in enumerate(live_dirs):
+            for live_dir in live_dirs:
                 live_dir.mkdir(parents=True, exist_ok=True)
                 dest_names = [f"{stem}.vdf"]
                 # 同时写入该手柄类型的当前布局文件，Steam 才会把它当作正在使用的配置
                 if ctype and not stem.startswith("controller_"):
                     dest_names.append(f"{ctype}.vdf")
-                # 去重并保持顺序
                 seen_names = []
                 for name in dest_names:
                     if name not in seen_names:
@@ -1146,46 +1181,11 @@ class SteamInputBackupApp:
 
                 for name in seen_names:
                     dest = live_dir / name
-                    if dest.exists():
-                        snap_stem = Path(name).stem
-                        snap = target_backup / f"{snap_stem}_{ts}_pre_migrate.vdf"
-                        n = 1
-                        while snap.exists():
-                            snap = target_backup / f"{snap_stem}_{ts}_pre_migrate_{n}.vdf"
-                            n += 1
-                        shutil.copy2(dest, snap)
-                        orig_hash = file_hash(dest)
-                        with open(snap.with_suffix(".meta.json"), "w", encoding="utf-8") as mf:
-                            json.dump({
-                                "original": str(dest),
-                                "game": target_game,
-                                "timestamp": ts,
-                                "hash": orig_hash,
-                                "note": "migrate_overwrite_backup",
-                            }, mf, ensure_ascii=False)
                     patched = retarget_controller_vdf(raw, source_game, target_game, dest)
                     dest.write_text(patched, encoding="utf-8")
                     live_written += 1
-                    if idx == 0 and name == f"{stem}.vdf":
-                        live_path = str(dest)
 
-            new_bak = target_backup / f"{stem}_{ts}.vdf"
-            n = 1
-            while new_bak.exists():
-                new_bak = target_backup / f"{stem}_{ts}_{n}.vdf"
-                n += 1
-            shutil.copy2(bak_path, new_bak)
-            with open(new_bak.with_suffix(".meta.json"), "w", encoding="utf-8") as mf:
-                json.dump({
-                    "original": live_path,
-                    "game": target_game,
-                    "timestamp": ts,
-                    "hash": file_hash(bak_path),
-                    "migrated_from": source_game,
-                }, mf, ensure_ascii=False)
-            bak_written += 1
-
-        return live_written, bak_written
+        return live_written
 
     def resolve_live_game_dir(self, game_name: str, hint_orig: str = "", create: bool = True) -> Path:
         """定位该游戏在 Steam 里的原始配置目录。"""
@@ -1363,54 +1363,124 @@ class SteamInputBackupApp:
         os.startfile(str(dest))
         self.status_var.set(f"已打开原目录: {dest}")
 
-    def open_backup_folder(self):
+    def get_selected_vdf_path(self):
+        """仅当当前选中的是 VDF 文件时返回路径，选中游戏或整份存档文件夹则返回 None。"""
         bak = self.get_selected_backup_path()
-        if bak:
-            os.startfile(str(bak if bak.is_dir() else bak.parent))
-        else:
-            os.startfile(self.settings["backup_dir"])
+        if bak and bak.is_file() and bak.suffix.lower() == ".vdf":
+            return bak
+        return None
+
+    def open_backup_folder(self):
+        bak = self.get_selected_vdf_path()
+        if not bak:
+            messagebox.showwarning("提示", "请先选择一个 VDF 文件，再在资源管理器中定位它。不会打开整个备份文件夹，以免误复制。")
+            return
+        ctypes.windll.shell32.ShellExecuteW(None, "open", "explorer.exe", f'/select,"{bak}"', None, 1)
+        self.status_var.set(f"已定位 VDF 文件: {bak.name}")
 
     # ---------- 设置窗口 ----------
     def open_settings(self):
-        win = ttk.Toplevel(self.root)
+        try:
+            self._open_settings()
+        except Exception as e:
+            messagebox.showerror("失败", f"无法打开设置: {e}")
+
+    def _place_dialog(self, win, min_w=640):
+        """按内容调整大小，并居中到主窗口（否则屏幕中央）。"""
+        win.update_idletasks()
+        w = max(win.winfo_reqwidth() + 24, min_w)
+        h = win.winfo_reqheight() + 16
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        w = min(w, max(320, sw - 40))
+        h = min(h, max(240, sh - 80))
+        parent = self.root
+        x = y = None
+        try:
+            if parent.winfo_viewable():
+                parent.update_idletasks()
+                x = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
+                y = parent.winfo_rooty() + (parent.winfo_height() - h) // 2
+        except Exception:
+            x = y = None
+        if x is None or y is None:
+            x = (sw - w) // 2
+            y = (sh - h) // 2
+        x = max(0, min(x, sw - w))
+        y = max(0, min(y, sh - h))
+        win.geometry(f"{w}x{h}+{x}+{y}")
+        win.minsize(min(w, 560), min(h, 320))
+
+    def _open_settings(self):
+        win = Toplevel(self.root)
         win.title("设置")
-        win.geometry("680x360")
         win.transient(self.root)
-        win.grab_set()
+        win.withdraw()
+        win.columnconfigure(1, weight=1)
 
-        ttk.Label(win, text="Steam 安装路径:").grid(row=0, column=0, sticky="w", padx=10, pady=8)
+        ttk.Label(win, text="Steam 安装路径:").grid(row=0, column=0, sticky="w", padx=(12, 8), pady=8)
         steam_var = StringVar(value=self.settings.get("steam_path", ""))
-        ttk.Entry(win, textvariable=steam_var, width=50).grid(row=0, column=1, padx=5)
-        ttk.Button(win, text="浏览", command=lambda: steam_var.set(filedialog.askdirectory())).grid(row=0, column=2)
-        ttk.Button(win, text="自动检测", command=lambda: steam_var.set(str(detect_steam_path() or ""))).grid(row=0, column=3)
+        path_row = ttk.Frame(win)
+        path_row.grid(row=0, column=1, sticky="ew", padx=(5, 12), pady=8)
+        path_row.columnconfigure(0, weight=1)
+        ttk.Entry(path_row, textvariable=steam_var).grid(row=0, column=0, sticky="ew")
+        ttk.Button(path_row, text="浏览", command=lambda: steam_var.set(filedialog.askdirectory())).grid(row=0, column=1, padx=(6, 0))
+        ttk.Button(path_row, text="自动检测", command=lambda: steam_var.set(str(detect_steam_path() or ""))).grid(row=0, column=2, padx=(6, 0))
 
-        ttk.Label(win, text="存档目录:").grid(row=1, column=0, sticky="w", padx=10, pady=8)
-        ttk.Label(win, text=str(DEFAULT_BACKUP_DIR), wraplength=420).grid(row=1, column=1, sticky="w", padx=5)
+        ttk.Label(win, text="存档目录:").grid(row=1, column=0, sticky="w", padx=(12, 8), pady=8)
+        ttk.Label(win, text=str(DEFAULT_BACKUP_DIR), wraplength=520).grid(row=1, column=1, sticky="w", padx=(5, 12))
         ttk.Label(
             win,
-            text="固定在软件同目录下。启动时只读取这里的存档；只有点击「立即存档」才会读取 Steam 里的 VDF。已有文件不会删除。",
+            text="固定在软件同目录下。启动时只读取这里的存档列表。",
             foreground="#555",
-            wraplength=420,
-        ).grid(row=2, column=1, sticky="w", padx=5, pady=(0, 8))
+            wraplength=520,
+        ).grid(row=2, column=1, sticky="w", padx=(5, 12), pady=(0, 8))
+
+        ttk.Label(win, text="定时对比:").grid(row=3, column=0, sticky="nw", padx=(12, 8), pady=8)
+        interval_frame = ttk.Frame(win)
+        interval_frame.grid(row=3, column=1, sticky="w", padx=(5, 12), pady=8)
+        interval_var = StringVar(value=normalize_check_interval(self.settings.get("check_interval")))
+        for key, label, _seconds in CHECK_INTERVAL_CHOICES:
+            ttk.Radiobutton(interval_frame, text=label, variable=interval_var, value=key).pack(side="left", padx=(0, 12))
+        ttk.Label(
+            win,
+            text="按所选间隔，对比最新时间戳存档与 Steam 原文件的 MD5，若不同则自动存档一份。选择「关闭」则不检查。",
+            foreground="#555",
+            wraplength=520,
+        ).grid(row=4, column=1, sticky="w", padx=(5, 12), pady=(0, 8))
 
         common_var = BooleanVar(value=self.settings.get("monitor_common", True))
-        ttk.Checkbutton(win, text="立即存档时包含 Steam Controller Configs 目录", variable=common_var).grid(row=3, column=1, sticky="w")
+        ttk.Checkbutton(win, text="立即存档或定时对比时包含 Steam Controller Configs 目录", variable=common_var).grid(row=5, column=1, sticky="w", padx=(5, 12))
 
-        userdata_var = BooleanVar(value=self.settings.get("monitor_userdata", True))
-        ttk.Checkbutton(win, text="立即存档时包含 userdata/241100/remote/controller_config 目录", variable=userdata_var).grid(row=4, column=1, sticky="w")
+        ttk.Label(win, text="备份次数上限:").grid(row=6, column=0, sticky="w", padx=(12, 8), pady=8)
+        max_frame = ttk.Frame(win)
+        max_frame.grid(row=6, column=1, sticky="w", padx=(5, 12), pady=8)
+        max_var = IntVar(value=normalize_max_backups(self.settings.get("max_backups")))
+        ttk.Spinbox(max_frame, from_=MIN_BACKUPS, to=MAX_BACKUPS_LIMIT, increment=1, width=6, textvariable=max_var).pack(side="left")
+        ttk.Label(max_frame, text=f"  次（{MIN_BACKUPS}–{MAX_BACKUPS_LIMIT}）。新存档后若超过上限，会自动删除最旧的时间戳存档。").pack(side="left")
 
         def save():
             self.settings["steam_path"] = steam_var.get()
             self.settings["backup_dir"] = str(DEFAULT_BACKUP_DIR)
-            self.settings["auto_backup"] = False
+            self.settings["check_interval"] = normalize_check_interval(interval_var.get())
+            try:
+                raw_max = max_var.get()
+            except Exception:
+                raw_max = DEFAULT_MAX_BACKUPS
+            self.settings["max_backups"] = normalize_max_backups(raw_max)
             self.settings["monitor_common"] = common_var.get()
-            self.settings["monitor_userdata"] = userdata_var.get()
+            self.settings.pop("monitor_userdata", None)
             self.save_settings()
+            self.check_wakeup.set()
             win.destroy()
             self.refresh_tree()
             messagebox.showinfo("成功", "设置已保存")
 
-        ttk.Button(win, text="保存", command=save).grid(row=6, column=1, pady=20)
+        ttk.Button(win, text="保存", command=save).grid(row=7, column=0, columnspan=2, pady=20)
+        self._place_dialog(win, min_w=640)
+        win.deiconify()
+        win.grab_set()
+        win.focus_force()
 
     # ---------- 系统托盘 ----------
     def create_tray_icon(self):
@@ -1463,6 +1533,7 @@ class SteamInputBackupApp:
 
     def quit_app(self, icon=None, item=None):
         self.running = False
+        self.check_wakeup.set()
         if self.tray_icon:
             self.tray_icon.stop()
         self.root.after(0, self.root.destroy)
